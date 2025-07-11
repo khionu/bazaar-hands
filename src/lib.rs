@@ -1,17 +1,22 @@
+use std::cell::OnceCell;
 // Standard lib
 use std::env;
-use std::sync::LazyLock;
+use std::io::BufReader;
+use std::sync::{LazyLock, OnceLock, OnceState};
 // Basic utilities
 use bytes::Bytes;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH};
 use hex::FromHex;
+use snafu::{prelude::*, Whatever};
 use tracing::{debug, error, info, Level};
 // HTTP
-use salvo::{
-  http::Method,
-  prelude::*
-};
 use http_body_util::BodyExt;
+use spin_sdk::http::{IntoResponse, Json, Method, Request, Response, ResponseBuilder};
+use spin_sdk::http::conversions::TryIntoBody;
+use spin_sdk::http::responses::{internal_server_error, method_not_allowed, not_found};
+use spin_sdk::http_component;
+use spin_sdk::wit_bindgen::rt::invalid_enum_discriminant;
+use tracing::field::debug;
 // Discord
 use twilight_http::Client;
 use twilight_model::{
@@ -53,93 +58,55 @@ pub static DISCORD_PUBKEY: LazyLock<VerifyingKey> = LazyLock::new(|| {
     .expect("BAZAAR_HAND_PUBLIC_KEY is not valid")
 });
 
-#[tokio::main]
-async fn main() {
-  tracing_subscriber::fmt()
-    .with_max_level(Level::DEBUG).init();
-
-  DISCORD_CLIENT.interaction(*APP_ID).set_global_commands(&*commands::CMDS).await.unwrap();
-
-  let router = Router::new()
-    .hoop(validate_hook)
-    .post(execute_hook);
-
-  let acceptor = TcpListener::new("0.0.0.0:1312").bind().await;
-
-  Server::new(acceptor).serve(router).await;
-}
-
-#[handler]
-async fn validate_hook(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-  if req.method() != Method::POST {
+/// A simple Spin HTTP component.
+#[http_component]
+async fn discord(req: Request) -> Response {
+  if *req.method() != Method::Post {
     debug!("Request was not POST");
-    res.render(StatusError::method_not_allowed());
-    return;
+    return method_not_allowed();
   }
 
-  if req.uri().path() != "/" {
-    debug!("Request was not to the root");
-    res.render(StatusError::not_found());
-    return;
+  if req.uri() != "https://boba.iamtrue.net/api/discord/" {
+    debug!("Bad URI: got {}", req.uri());
+    return not_found();
   }
 
-  let Some(timestamp) = req.header::<Bytes>("X-Signature-Timestamp") else {
+  let Some(timestamp) = req
+    .header("X-Signature-Timestamp")
+    .map(|x| Bytes::copy_from_slice(x.as_bytes())) else {
     debug!("Timestamp missing");
-    res.render(StatusError::bad_request());
-    return;
+    return invalid_request();
   };
 
-  let Some(sig) = req.header::<Bytes>("X-Signature-Ed25519") else {
+  let Some(sig) = req
+    .header("X-Signature-Ed25519")
+    .map(|x| Bytes::copy_from_slice(x.as_bytes())) else {
     debug!("Signature missing");
-    res.render(StatusError::bad_request());
-    return;
+    return invalid_request();
   };
 
   let Ok(sig) = Vec::<u8>::from_hex(sig) else {
     debug!("Signature not valid hex");
-    res.render(StatusError::bad_request());
-    return;
+    return invalid_request();
   };
 
   let Ok(sig) = Signature::from_slice(sig.as_slice()) else {
     debug!("Signature is not valid");
-    res.render(StatusError::bad_request());
-    return;
+    return invalid_request();
   };
 
-  let Ok(body) = req.take_body().collect().await.map(|x| x.to_bytes()) else {
-    error!("Request body could not be collected");
-    res.render(StatusError::bad_request());
-    return;
-  };
-
-  let key = VerifyingKey::from_bytes(
-    &<[u8; 32]>::from_hex("2f6fc6bf399e58ab166002cb4f1a5b38a51d1f788ac9a24ad916e2f317cada67").unwrap()
-  ).expect("Invalid DISCORD_KEY");
-
-  if key.verify([timestamp.as_ref(), &body].concat().as_ref(), &sig).is_err() {
+  if DISCORD_PUBKEY.verify(&[timestamp.as_ref(), req.body()].concat(), &sig).is_err() {
     debug!("Payload failed verification");
-    res.render(StatusError::unauthorized());
-    return;
+    return invalid_request();
   }
 
-  let Ok(interaction) = serde_json::from_slice::<Interaction>(&body) else {
+  let Ok(i) = serde_json::from_slice::<Interaction>(req.body()) else {
     error!("Error parsing Interaction - we might need to update Twilight?");
-    res.render(StatusError::internal_server_error());
-    return;
+    return internal_server_error();
   };
 
   debug!("Request passed validation and parsed");
-
-  depot.insert("INTERACTION", interaction);
-}
-
-#[handler]
-async fn execute_hook(depot: &mut Depot, res: &mut Response) {
   info!("Handling Discord Webhook");
-
-  let i = depot.remove::<Interaction>("INTERACTION")
-    .expect("Interaction missing");
 
   let result = match i.kind.clone() {
     InteractionType::Ping => Ok(InteractionResponse {
@@ -167,6 +134,21 @@ async fn execute_hook(depot: &mut Depot, res: &mut Response) {
       data: Some(resp),
     }
   });
+  
+  let resp = Json(resp).try_into_body()
+    .expect("Twilight's JSON serialization failed");
 
-  res.render(Json(resp));
+  Response::builder().status(200).body(resp).build()
+}
+
+fn invalid_request() -> Response {
+  Response::builder().status(401).body("invalid request signature").build()
+}
+
+#[unsafe(export_name = "wizer.initialize")]
+pub extern "C" fn init() {
+  futures::executor::block_on(async {
+    DISCORD_CLIENT.interaction(*APP_ID).set_global_commands(&*commands::CMDS).await
+      .expect("Failed to set global commands");
+  });
 }

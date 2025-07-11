@@ -1,0 +1,26 @@
+spin_manifest_version = 2
+
+# General identification information
+[application]
+name = "bazaar"
+version = "1.0.0"
+description = "A simple application that returns hello world."
+
+# The application's sole trigger. This application responds to HTTP requests
+# on the path "/hello", and handles them using the "hello" component.
+[[trigger.http]]
+route = "/discord"
+component = "discord"
+
+# The "hello" component
+[component.discord]
+description = "The Slash Command interface"
+# The Wasm module to run for the component
+source = "target/wasm32-wasip1/release/bazaar_hands.wasm"
+# Give access to DB
+sqlite_databases = ["main"]
+# Allo access to Discord API
+allowed_outbound_hosts = ["https://discord.com/api"]
+# How to build the Wasm module from source
+[component.discord.build]
+command = "cargo build --target wasm32-wasip1 --release"

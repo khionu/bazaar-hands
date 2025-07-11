@@ -8,6 +8,7 @@ pub async fn cmd(i_token: String) -> Result<InteractionResponse, Whatever> {
     const ITERATIONS: usize = 8;
     let mut rt_set = [0u32; ITERATIONS];
     let i_client = crate::DISCORD_CLIENT.interaction(*crate::APP_ID);
+    
     for i in 0..ITERATIONS {
       let content = format!("Pinging ...");
       let start = Instant::now();
